@@ -4,7 +4,7 @@ set_time_limit(0);
 ignore_user_abort(true);
 
 // --- VERSION ---
-define('APP_VERSION', '0.2.0');
+define('APP_VERSION', '0.3.0');
 
 // --- CONFIG ---
 $BASE_DIR = realpath(__DIR__ . '/files');
@@ -13,8 +13,44 @@ if ($BASE_DIR === false) {
     $BASE_DIR = realpath(__DIR__ . '/files');
 }
 $MAX_FILES_IN_ZIP = 10000;
+
+// Show hidden files/folders (names starting with ".") — false to hide them
+$SHOW_HIDDEN_FILES = false;
+
+// Whitelist: if non-empty, only show items matching any of these glob patterns (relative to BASE_DIR).
+// E.g. ["data/*", "*.txt"] — only items under data/ or .txt files are shown.
+$WHITELIST = [];
+
+// Blacklist: hide items matching any of these glob patterns (applied after whitelist).
+// E.g. ["*.bak", "tmp/*"]
+$BLACKLIST = [];
+
+// Maximum thumbnail dimension (width or height) in pixels
+$THUMB_MAX_DIM = 400;
+
+// Enable download/access logging (IP, file, timestamp stored in SQLite)
+$ENABLE_LOGGING = false;
+
+// --- Cache directory ---
+$CACHE_DIR_OWNER="www-data"; // Set to your web server user (e.g. www-data, apache, nginx) or null to use current user
 $CACHE_DIR = __DIR__ . '/.cache_fb';
-if (!is_dir($CACHE_DIR)) @mkdir($CACHE_DIR, 0755, true);
+$CACHE_ERROR = false;
+if (!is_dir($CACHE_DIR)) {
+    if (!@mkdir($CACHE_DIR, 0755, true)) {
+        $CACHE_ERROR = 'Cache directory could not be created: ' . htmlspecialchars($CACHE_DIR);
+    }
+}
+if (!$CACHE_ERROR && $CACHE_DIR_OWNER !== null) {
+    $currentOwner = posix_getpwuid(fileowner($CACHE_DIR))['name'] ?? '';
+    if ($currentOwner !== $CACHE_DIR_OWNER) {
+        if (!@chown($CACHE_DIR, $CACHE_DIR_OWNER)) {
+            $CACHE_ERROR = 'Cache directory ownership could not be changed to ' . htmlspecialchars($CACHE_DIR_OWNER) . '. Current owner is: ' . htmlspecialchars($currentOwner);
+        }
+    }
+}
+if (!$CACHE_ERROR && !is_writable($CACHE_DIR)) {
+    $CACHE_ERROR = 'Cache directory is not writable: ' . htmlspecialchars($CACHE_DIR);
+}
 
 // --- Extension to icon/type mapping ---
 function file_icon($name) {
@@ -105,12 +141,14 @@ function safe_basename($path) {
 }
 
 function list_directory($path) {
+    global $BASE_DIR;
     $items = [];
     if (!is_dir($path)) return $items;
     $dh = opendir($path);
     if (!$dh) return $items;
     while (($entry = readdir($dh)) !== false) {
         if ($entry === '.' || $entry === '..') continue;
+        if (!should_show_entry($entry, $path . DIRECTORY_SEPARATOR . $entry)) continue;
         $full = $path . DIRECTORY_SEPARATOR . $entry;
         $isDir = is_dir($full);
         $size = $isDir ? -1 : (is_file($full) ? filesize($full) : 0);
@@ -122,6 +160,126 @@ function list_directory($path) {
     }
     closedir($dh);
     return $items;
+}
+
+// Determine if a file/folder should be shown, based on hidden/whitelist/blacklist config.
+// Directories are shown if they directly match OR contain any visible descendants.
+function should_show_entry($name, $absPath) {
+    global $SHOW_HIDDEN_FILES, $WHITELIST, $BLACKLIST, $BASE_DIR;
+
+    // Hidden files
+    if (!$SHOW_HIDDEN_FILES && $name !== '' && $name[0] === '.') return false;
+
+    // Compute relative path from BASE_DIR for glob matching
+    $rel = ltrim(str_replace('\\', '/', substr($absPath, strlen($BASE_DIR))), '/');
+    $isDir = is_dir($absPath);
+    if ($isDir) $rel .= '/';
+
+    // Blacklist: if item matches any pattern, hide it (check before whitelist/recurse)
+    if (!empty($BLACKLIST)) {
+        foreach ($BLACKLIST as $pattern) {
+            if (_glob_match($pattern, $rel, $name)) return false;
+        }
+    }
+
+    // Whitelist: if set, item must match at least one pattern
+    if (!empty($WHITELIST)) {
+        $matched = false;
+        foreach ($WHITELIST as $pattern) {
+            if (_glob_match($pattern, $rel, $name)) { $matched = true; break; }
+        }
+        if (!$matched) {
+            // For directories: show if any descendant is visible
+            if ($isDir) {
+                return _dir_has_visible_descendant($absPath);
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// Recursively check if a directory contains at least one visible entry.
+// Uses a short-circuit scan — returns true as soon as any visible child is found.
+function _dir_has_visible_descendant($dirPath) {
+    global $SHOW_HIDDEN_FILES, $WHITELIST, $BLACKLIST, $BASE_DIR;
+    static $cache = [];
+    $realDir = realpath($dirPath);
+    if ($realDir === false) return false;
+    if (isset($cache[$realDir])) return $cache[$realDir];
+
+    // Prevent infinite recursion on symlink loops
+    $cache[$realDir] = false;
+
+    $dh = @opendir($dirPath);
+    if (!$dh) return false;
+    while (($entry = readdir($dh)) !== false) {
+        if ($entry === '.' || $entry === '..') continue;
+        if (!$SHOW_HIDDEN_FILES && $entry[0] === '.') continue;
+        $child = $dirPath . DIRECTORY_SEPARATOR . $entry;
+        $rel = ltrim(str_replace('\\', '/', substr($child, strlen($BASE_DIR))), '/');
+        $childIsDir = is_dir($child);
+        if ($childIsDir) $rel .= '/';
+
+        // Check blacklist first
+        $blacklisted = false;
+        if (!empty($BLACKLIST)) {
+            foreach ($BLACKLIST as $pattern) {
+                if (_glob_match($pattern, $rel, $entry)) { $blacklisted = true; break; }
+            }
+        }
+        if ($blacklisted) continue;
+
+        // Check whitelist
+        if (!empty($WHITELIST)) {
+            $matched = false;
+            foreach ($WHITELIST as $pattern) {
+                if (_glob_match($pattern, $rel, $entry)) { $matched = true; break; }
+            }
+            if ($matched) {
+                // Found a visible child — this directory should be shown
+                closedir($dh);
+                $cache[$realDir] = true;
+                return true;
+            }
+            // Not matched: if it's a dir, recurse into it
+            if ($childIsDir && _dir_has_visible_descendant($child)) {
+                closedir($dh);
+                $cache[$realDir] = true;
+                return true;
+            }
+        } else {
+            // No whitelist — any non-blacklisted child is visible
+            closedir($dh);
+            $cache[$realDir] = true;
+            return true;
+        }
+    }
+    closedir($dh);
+    return false;
+}
+
+// Match a simple glob pattern against a relative path or basename.
+// Supports: * (any non-/ chars), ** (any path), ? (single char).
+// Patterns like "data/*" match anything under data/. Patterns like "*.txt" match by name.
+function _glob_match($pattern, $relPath, $basename) {
+    $pattern = rtrim($pattern, '/');
+    $relClean = rtrim($relPath, '/');
+
+    // If pattern has no '/', match against basename only
+    if (strpos($pattern, '/') === false) {
+        return fnmatch($pattern, $basename);
+    }
+
+    // Pattern has '/' — match against full relative path
+    // Also allow prefix match for directories (so "data" matches "data/foo.txt")
+    if (fnmatch($pattern, $relClean)) return true;
+    if (fnmatch($pattern . '/*', $relClean)) return true;
+    // For directories, also check if path starts with pattern
+    if (fnmatch($pattern, dirname($relClean)) || fnmatch($pattern . '/*', dirname($relClean))) return true;
+
+    return false;
 }
 
 function build_breadcrumbs($relPath) {
@@ -749,6 +907,7 @@ if ($action === 'api_dircheck') {
         while (($entry = readdir($dh)) !== false) {
             if ($entry === '.' || $entry === '..') continue;
             $fp = $absPath . '/' . $entry;
+            if (!should_show_entry($entry, $fp)) continue;
             $entries[] = $entry . ':' . @filesize($fp) . ':' . @filemtime($fp);
         }
         closedir($dh);
@@ -848,10 +1007,14 @@ if ($action === 'api_detail') {
 
 // --- API: stream file inline (for in-browser viewing) ---
 if ($action === 'api_stream') {
-    list(, $abs) = resolve_requested_path($requested);
+    list($streamRel, $abs) = resolve_requested_path($requested);
     if (!$abs || !is_file($abs) || !is_readable($abs)) {
         header($_SERVER["SERVER_PROTOCOL"] . " 404 Not Found");
         echo "File not found."; exit;
+    }
+    // Log only on first request (not range sub-requests)
+    if (!isset($_SERVER['HTTP_RANGE'])) {
+        log_download($streamRel);
     }
     $finfo = finfo_open(FILEINFO_MIME_TYPE);
     $mime = finfo_file($finfo, $abs) ?: 'application/octet-stream';
@@ -910,8 +1073,65 @@ if ($action === 'api_stream') {
     exit;
 }
 
+// --- API: recursive search ---
+if ($action === 'api_search') {
+    header('Content-Type: application/json');
+    header('Cache-Control: no-cache');
+    $q = trim($_GET['q'] ?? '');
+    $searchPath = $_GET['path'] ?? '';
+    $maxResults = 200;
+    if ($q === '' || strlen($q) < 2) {
+        echo json_encode(['error' => 'Query too short', 'items' => []]); exit;
+    }
+    list($relBase, $absBase) = resolve_requested_path($searchPath);
+    if ($absBase === false || !is_dir($absBase)) {
+        echo json_encode(['error' => 'Invalid path', 'items' => []]); exit;
+    }
+    $qLower = mb_strtolower($q);
+    $results = [];
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($absBase, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+    foreach ($it as $file) {
+        $name = $file->getFilename();
+        if (!should_show_entry($name, $file->getPathname())) continue;
+        if (mb_strpos(mb_strtolower($name), $qLower) === false) continue;
+        $isDir = $file->isDir();
+        $fullRel = ltrim(str_replace('\\', '/', substr($file->getPathname(), strlen($BASE_DIR))), '/');
+        $cat = $isDir ? 'folder' : file_category($name);
+        $icon = $isDir ? '📁' : file_icon($name);
+        $hasMedia = in_array($cat, ['image','audio','video','document']);
+        $viewMode = $isDir ? null : file_view_mode($name);
+        $results[] = [
+            'name' => $name, 'is_dir' => $isDir,
+            'size' => $isDir ? -1 : $file->getSize(),
+            'mtime' => $file->getMTime(),
+            'cat' => $cat, 'icon' => $icon, 'path' => $fullRel,
+            'has_media' => $hasMedia, 'view' => $viewMode ?: null,
+        ];
+        if (count($results) >= $maxResults) break;
+    }
+    echo json_encode(['items' => $results, 'truncated' => count($results) >= $maxResults]);
+    exit;
+}
+
+// --- API: get download counts for a list of paths ---
+if ($action === 'api_dlcounts') {
+    header('Content-Type: application/json');
+    $input = json_decode(file_get_contents('php://input'), true);
+    $paths = $input['paths'] ?? [];
+    if (!is_array($paths) || empty($paths)) {
+        echo json_encode(['counts' => []]); exit;
+    }
+    $counts = get_download_counts_batch($paths);
+    echo json_encode(['counts' => $counts]);
+    exit;
+}
+
 function generate_image_thumbnail($srcPath, $dstPath) {
-    $maxDim = 240;
+    global $THUMB_MAX_DIM;
+    $maxDim = $THUMB_MAX_DIM ?: 240;
     $ext = strtolower(pathinfo($srcPath, PATHINFO_EXTENSION));
 
     // Formats that need ImageMagick (convert): svg, ico, tiff, heic, heif, psd
@@ -969,6 +1189,8 @@ function _thumbnail_via_convert($srcPath, $dstPath, $maxDim = 240) {
 }
 
 function generate_video_thumbnail($srcPath, $dstPath) {
+    global $THUMB_MAX_DIM;
+    $maxDim = $THUMB_MAX_DIM ?: 240;
     // Determine seek position: 10% of duration (fallback to 1s)
     $seekSec = 1;
     $probe = shell_exec('ffprobe -v error -show_entries format=duration -of csv=p=0 '
@@ -978,13 +1200,13 @@ function generate_video_thumbnail($srcPath, $dstPath) {
         $seekSec = max(0, $duration * 0.10);
     }
     $cmd = 'ffmpeg -y -ss ' . $seekSec . ' -i ' . escapeshellarg($srcPath)
-         . ' -vframes 1 -vf "scale=240:-1" -q:v 4 ' . escapeshellarg($dstPath)
+         . ' -vframes 1 -vf "scale=' . $maxDim . ':-1" -q:v 4 ' . escapeshellarg($dstPath)
          . ' 2>/dev/null';
     exec($cmd, $out, $ret);
     if ($ret !== 0 || !is_file($dstPath)) {
         // Fallback: try at 0 seconds
         $cmd = 'ffmpeg -y -ss 0 -i ' . escapeshellarg($srcPath)
-             . ' -vframes 1 -vf "scale=240:-1" -q:v 4 ' . escapeshellarg($dstPath)
+             . ' -vframes 1 -vf "scale=' . $maxDim . ':-1" -q:v 4 ' . escapeshellarg($dstPath)
              . ' 2>/dev/null';
         exec($cmd, $out, $ret);
     }
@@ -992,9 +1214,11 @@ function generate_video_thumbnail($srcPath, $dstPath) {
 }
 
 function generate_pdf_thumbnail($srcPath, $dstPath) {
+    global $THUMB_MAX_DIM;
+    $maxDim = $THUMB_MAX_DIM ?: 240;
     // Use pdftoppm to render first page as JPEG thumbnail
     $tmpPrefix = $dstPath . '_tmp';
-    $cmd = 'pdftoppm -jpeg -f 1 -l 1 -scale-to 240 -singlefile '
+    $cmd = 'pdftoppm -jpeg -f 1 -l 1 -scale-to ' . (int)$maxDim . ' -singlefile '
          . escapeshellarg($srcPath) . ' ' . escapeshellarg($tmpPrefix) . ' 2>/dev/null';
     exec($cmd, $out, $ret);
     $tmpFile = $tmpPrefix . '.jpg';
@@ -1081,6 +1305,74 @@ function get_document_info($filePath) {
     return $result;
 }
 
+// --- Download/access logging ---
+function get_log_db() {
+    global $CACHE_DIR;
+    $dbPath = $CACHE_DIR . '/logs.sqlite';
+    $db = new SQLite3($dbPath);
+    $db->busyTimeout(2000);
+    $db->exec('CREATE TABLE IF NOT EXISTS download_counts (
+        path TEXT PRIMARY KEY,
+        count INTEGER NOT NULL DEFAULT 0
+    )');
+    $db->exec('CREATE TABLE IF NOT EXISTS access_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL,
+        ip TEXT,
+        ts TEXT NOT NULL
+    )');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_access_log_path ON access_log(path)');
+    return $db;
+}
+
+function log_download($relPath) {
+    global $ENABLE_LOGGING, $CACHE_ERROR;
+    if ($CACHE_ERROR) return;
+    $db = get_log_db();
+    // Always increment download count
+    $stmt = $db->prepare('INSERT INTO download_counts (path, count) VALUES (:p, 1)
+        ON CONFLICT(path) DO UPDATE SET count = count + 1');
+    $stmt->bindValue(':p', $relPath, SQLITE3_TEXT);
+    $stmt->execute();
+    // Detailed access log only if enabled
+    if ($ENABLE_LOGGING) {
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $stmt2 = $db->prepare('INSERT INTO access_log (path, ip, ts) VALUES (:p, :ip, :ts)');
+        $stmt2->bindValue(':p', $relPath, SQLITE3_TEXT);
+        $stmt2->bindValue(':ip', $ip, SQLITE3_TEXT);
+        $stmt2->bindValue(':ts', date('c'), SQLITE3_TEXT);
+        $stmt2->execute();
+    }
+    $db->close();
+}
+
+function get_download_count($relPath) {
+    global $CACHE_ERROR;
+    if ($CACHE_ERROR) return 0;
+    $db = get_log_db();
+    $stmt = $db->prepare('SELECT count FROM download_counts WHERE path = :p');
+    $stmt->bindValue(':p', $relPath, SQLITE3_TEXT);
+    $r = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    $db->close();
+    return $r ? (int)$r['count'] : 0;
+}
+
+function get_download_counts_batch($paths) {
+    global $CACHE_ERROR;
+    if ($CACHE_ERROR || empty($paths)) return [];
+    $db = get_log_db();
+    $result = [];
+    $stmt = $db->prepare('SELECT count FROM download_counts WHERE path = :p');
+    foreach ($paths as $p) {
+        $stmt->bindValue(':p', $p, SQLITE3_TEXT);
+        $r = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+        $result[$p] = $r ? (int)$r['count'] : 0;
+        $stmt->reset();
+    }
+    $db->close();
+    return $result;
+}
+
 // --- Download ---
 list($requestedRel, $absRequested) = resolve_requested_path($requested);
 if ($absRequested === false) {
@@ -1090,7 +1382,10 @@ if ($absRequested === false) {
 
 if ($action === 'download') {
     if (!file_exists($absRequested)) { header($_SERVER["SERVER_PROTOCOL"]." 404 Not Found"); echo "Not found."; exit; }
-    if (is_file($absRequested)) send_file_response($absRequested);
+    if (is_file($absRequested)) {
+        log_download($requestedRel);
+        send_file_response($absRequested);
+    }
     if (is_dir($absRequested)) {
         $fileCount = 0;
         $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($absRequested, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::LEAVES_ONLY);
@@ -1128,13 +1423,28 @@ $crumbs = build_breadcrumbs($requestedRel);
 $currentRel = $requestedRel;
 $scriptName = htmlspecialchars($_SERVER['SCRIPT_NAME']);
 ?>
-<?php $themeClass = ($_COOKIE['fb_theme'] ?? '') === 'light' ? ' class="light"' : ''; ?>
+<?php
+// Theme: use cookie if set, otherwise no class (JS will detect OS preference)
+$themeCookie = $_COOKIE['fb_theme'] ?? '';
+$themeClass = '';
+if ($themeCookie === 'light') $themeClass = ' class="light"';
+elseif ($themeCookie === 'dark') $themeClass = '';
+// If no cookie → no class; JS will apply OS preference on load
+?>
 <!doctype html>
 <html lang="en"<?php echo $themeClass; ?>>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>PHP Autoindexed File-Viewer v<?php echo APP_VERSION; ?><?php echo $currentRel ? ' - /'.htmlspecialchars($currentRel) : ''; ?></title>
+<?php if (!$themeCookie): ?>
+<script>
+// Detect OS preference before first paint to avoid flash
+if(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches){
+  document.documentElement.classList.add('light');
+}
+</script>
+<?php endif; ?>
 <!-- lean inline favicon block -->
 <link rel="shortcut icon" href="data:image/x-icon;base64,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">
 <style>
@@ -1200,7 +1510,7 @@ a:visited{color:var(--accent)}
 /* Thumbnail popup */
 .thumb-popup{display:none;position:fixed;z-index:10001;background:var(--popup-bg);border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 8px 32px rgba(0,0,0,0.3);pointer-events:none}
 .thumb-popup.active{display:block}
-.thumb-popup img{display:block;max-width:240px;max-height:240px;border-radius:4px}
+.thumb-popup img{display:block;max-width:<?php echo $THUMB_MAX_DIM; ?>px;max-height:<?php echo $THUMB_MAX_DIM; ?>px;border-radius:4px}
 /* Theme toggle */
 .theme-toggle{background:none;border:none;cursor:pointer;font-size:18px;padding:2px 6px;line-height:1;color:var(--text)}
 /* Queue status */
@@ -1254,9 +1564,27 @@ a:visited{color:var(--accent)}
 .viewer-nav.prev{left:12px}
 .viewer-nav.next{right:12px}
 .viewer-nav:disabled{opacity:0.2;cursor:default}
+/* Error overlay */
+.error-overlay{position:fixed;top:0;left:0;right:0;bottom:0;z-index:50000;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center}
+.error-box{background:var(--card);border:1px solid #e74c3c;border-radius:12px;padding:24px 32px;max-width:500px;color:var(--text);text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
+.error-box h2{color:#e74c3c;margin:0 0 12px;font-size:18px}
+.error-box p{color:var(--muted);font-size:13px;margin:0 0 8px;line-height:1.5}
+.error-box code{background:var(--input-bg);padding:2px 6px;border-radius:4px;font-size:12px}
+/* Download count badge */
+.dl-count{font-size:11px;color:var(--muted);opacity:0.7}
 </style>
 </head>
 <body>
+<?php if ($CACHE_ERROR): ?>
+<div class="error-overlay">
+  <div class="error-box">
+    <h2>⚠️ Configuration Error</h2>
+    <p><?php echo $CACHE_ERROR; ?></p>
+    <p>Please create the directory and ensure the web server can write to it:</p>
+    <p><code>mkdir -p <?php echo htmlspecialchars($CACHE_DIR); ?> && chmod 755 <?php echo htmlspecialchars($CACHE_DIR); ?> && chown -R <?php echo htmlspecialchars($CACHE_DIR_OWNER) . ":" . htmlspecialchars($CACHE_DIR_OWNER); ?> <?php echo htmlspecialchars($CACHE_DIR); ?></code></p>
+  </div>
+</div>
+<?php endif; ?>
 <div class="container">
   <div class="header">
     <div class="title">PHP Autoindexed File-Viewer v<?php echo APP_VERSION; ?></div>
@@ -1291,6 +1619,9 @@ a:visited{color:var(--accent)}
       <option value="archive">Archives</option>
       <option value="other">Other</option>
     </select>
+    <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:var(--muted);cursor:pointer;white-space:nowrap">
+      <input type="checkbox" id="searchRecursive" style="margin:0"/> Recursive
+    </label>
   </div>
 
   <?php if (count($items) === 0): ?>
@@ -1415,7 +1746,13 @@ if(!getCookie('fb_cookie_ok')){
 
 // --- Theme toggle ---
 var html = document.documentElement;
-// Theme already set server-side via PHP cookie read; JS handles toggle only
+// If no cookie was set, detect OS preference and persist it
+if(!getCookie('fb_theme')){
+  if(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches){
+    html.classList.add('light');
+  }
+  setCookie('fb_theme', html.classList.contains('light') ? 'light' : 'dark');
+}
 var toggleBtn = document.getElementById('themeToggle');
 function updateToggleIcon(){ toggleBtn.textContent = html.classList.contains('light') ? '\u263D' : '\u2600'; }
 updateToggleIcon();
@@ -1504,8 +1841,21 @@ sortTable(currentSort, currentDir);
 // --- Search & filter ---
 var searchInput = document.getElementById('searchInput');
 var filterType = document.getElementById('filterType');
+var searchRecursive = document.getElementById('searchRecursive');
+var recursiveDebounce = null;
+var originalRows = null; // stash of original rows when showing recursive results
+var isShowingRecursive = false;
 
 function applyFilters(){
+  // If recursive is checked and there's a query, do server-side recursive search
+  if(searchRecursive.checked && searchInput.value.trim().length >= 2){
+    clearTimeout(recursiveDebounce);
+    recursiveDebounce = setTimeout(doRecursiveSearch, 400);
+    return;
+  }
+  // Restore original rows if we were showing recursive results
+  restoreOriginalRows();
+  // Local filter
   var q = searchInput.value.toLowerCase();
   var t = filterType.value;
   getRows().forEach(function(r){
@@ -1516,8 +1866,46 @@ function applyFilters(){
     r.classList.toggle('hidden', !(matchName && matchType));
   });
 }
+
+function doRecursiveSearch(){
+  var q = searchInput.value.trim();
+  if(q.length < 2) return;
+  // Stash original rows
+  if(!isShowingRecursive){
+    originalRows = Array.from(tbody.querySelectorAll('tr'));
+  }
+  fetch('?'+new URLSearchParams({action:'api_search',path:folderPath,q:q}))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.items) return;
+      var t = filterType.value;
+      // Clear tbody except parentrow
+      getRows().forEach(function(r){ r.remove(); });
+      d.items.forEach(function(it){
+        if(t && it.cat !== t) return;
+        var tmp = document.createElement('tbody');
+        tmp.innerHTML = buildRowHTML(it);
+        var newRow = tmp.firstChild;
+        tbody.appendChild(newRow);
+        wireRowHandlers(newRow);
+      });
+      isShowingRecursive = true;
+      sortTable(currentSort, currentDir);
+      if(typeof loadDownloadCounts === 'function') loadDownloadCounts();
+    })
+    .catch(function(e){ console.error('Recursive search failed', e); });
+}
+
+function restoreOriginalRows(){
+  if(!isShowingRecursive || !originalRows) return;
+  getRows().forEach(function(r){ r.remove(); });
+  originalRows.forEach(function(r){ tbody.appendChild(r); });
+  isShowingRecursive = false;
+}
+
 searchInput.addEventListener('input', applyFilters);
 filterType.addEventListener('change', applyFilters);
+searchRecursive.addEventListener('change', applyFilters);
 
 // =========== QUEUE-BASED ASYNC LOADING ===========
 var queueStatusEl = document.getElementById('queueStatus');
@@ -1701,6 +2089,38 @@ function applyResult(r){
 // Kick off!
 collectAndEnqueue();
 
+// --- Fetch and display download counts ---
+function loadDownloadCounts(){
+  var paths = [];
+  getRows().forEach(function(r){
+    if(r.dataset.isdir === '0') paths.push(r.dataset.path);
+  });
+  if(paths.length === 0) return;
+  fetch('?action=api_dlcounts', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paths:paths})
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if(!d.counts) return;
+    getRows().forEach(function(r){
+      if(r.dataset.isdir === '1') return;
+      var count = d.counts[r.dataset.path];
+      if(!count) return;
+      var actionsDiv = r.querySelector('.actions');
+      if(actionsDiv){
+        var badge = actionsDiv.querySelector('.dl-count');
+        if(!badge){ badge = document.createElement('span'); badge.className='dl-count'; actionsDiv.appendChild(badge); }
+        badge.textContent = count + '×';
+        badge.title = count + ' download' + (count !== 1 ? 's' : '');
+      }
+    });
+  })
+  .catch(function(){});
+}
+loadDownloadCounts();
+
 // --- Queue status hover popup ---
 queueStatusEl.addEventListener('mouseenter', function(){
   clearTimeout(queueHoverTimer);
@@ -1744,22 +2164,24 @@ var popupTimer = null;
 
 function positionFixed(anchor, popup){
   var r = anchor.getBoundingClientRect();
+  var vw = window.innerWidth, vh = window.innerHeight;
+  // Clamp max-height so popup never exceeds viewport
+  popup.style.maxHeight = (vh - 8) + 'px';
   popup.style.left = r.left + 'px';
   popup.style.top = (r.bottom + 4) + 'px';
   requestAnimationFrame(function(){
     var pr = popup.getBoundingClientRect();
-    var vw = window.innerWidth, vh = window.innerHeight;
     // Flip above anchor if overflows bottom
     if(pr.bottom > vh){
       var above = r.top - pr.height - 4;
       popup.style.top = (above >= 0 ? above : 4) + 'px';
     }
-    // Constrain top to viewport
+    // Constrain to viewport edges
     pr = popup.getBoundingClientRect();
     if(pr.top < 0) popup.style.top = '4px';
-    // Constrain right edge
+    pr = popup.getBoundingClientRect();
+    if(pr.bottom > vh) popup.style.top = Math.max(4, vh - pr.height - 4) + 'px';
     if(pr.right > vw) popup.style.left = Math.max(4, vw - pr.width - 8) + 'px';
-    // Constrain left edge
     pr = popup.getBoundingClientRect();
     if(pr.left < 0) popup.style.left = '4px';
   });
