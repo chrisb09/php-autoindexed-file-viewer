@@ -1,0 +1,8 @@
+.*
+!.gitignore
+files/
+.cache_fb/
+*.bak
+gen_favicon_header.py
+logo/
+!logo/256.png

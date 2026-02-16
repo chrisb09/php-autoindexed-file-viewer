@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  # PHP-FPM application
+  app:
+    image: chrisb09/php-autoindexed-file-viewer:latest
+    container_name: php-autoindexed-file-viewer
+    volumes:
+      # Mount files directory for persistence
+      - ../files:/app/files
+      # Mount cache directory for persistence
+      - file_browser_cache:/app/.cache_fb
+      # Optional: Mount folders you have symbolically linked to
+      # Here the contents of the hosts /var/www directory will be available in the container at /var/www
+      # - /var/www:/var/www:ro
+    environment:
+      # Optional: Set PHP memory limit
+      - PHP_MEMORY_LIMIT=512M
+      # Optional: Set max file upload size
+      - PHP_UPLOAD_MAX_FILESIZE=10G
+      - PHP_POST_MAX_SIZE=10G
+    restart: unless-stopped
+    networks:
+      - file_browser_net
+
+  # nginx web server
+  web:
+    image: nginx:latest
+    container_name: file_browser_web
+    ports:
+      - "7480:80"
+      # Uncomment for HTTPS with certificate:
+      # - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Uncomment for HTTPS:
+      # - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+    networks:
+      - file_browser_net
+
+volumes:
+  file_browser_cache:
+    driver: local
+
+networks:
+  file_browser_net:
+    driver: bridge
