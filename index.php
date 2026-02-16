@@ -4,7 +4,7 @@ set_time_limit(0);
 ignore_user_abort(true);
 
 // --- VERSION ---
-define('APP_VERSION', '0.1.0');
+define('APP_VERSION', '0.2.0');
 
 // --- CONFIG ---
 $BASE_DIR = realpath(__DIR__ . '/files');
@@ -47,6 +47,27 @@ function file_category($name) {
         if (in_array($ext, $exts)) return $cat;
     }
     return 'other';
+}
+
+// Determine how a file can be viewed in-browser: 'modal', 'tab', or false
+function file_view_mode($name) {
+    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    // Modal: formats browsers can natively play/display
+    $modal = [
+        // Video (browser-native)
+        'mp4','webm','ogv','mov',
+        // Audio (browser-native)
+        'mp3','ogg','wav','flac','m4a','opus','aac',
+        // Images (browser-native)
+        'jpg','jpeg','png','gif','bmp','svg','webp','ico','avif',
+        // Text/code
+        'txt','md','log','csv','json','xml','html','css','js','py','php','sh','c','cpp','h','java','rs','go','rb','ts',
+    ];
+    // New tab: formats that work better in their own tab (PDF, etc.)
+    $tab = ['pdf'];
+    if (in_array($ext, $modal)) return 'modal';
+    if (in_array($ext, $tab)) return 'tab';
+    return false;
 }
 
 // --- Helpers ---
@@ -756,11 +777,13 @@ if ($action === 'api_dirlist') {
         $icon = $it['is_dir'] ? '📁' : file_icon($it['name']);
         $rp = $relPath === '' ? $it['name'] : ($relPath . '/' . $it['name']);
         $hasMedia = in_array($cat, ['image','audio','video','document']);
+        $viewMode = $it['is_dir'] ? false : file_view_mode($it['name']);
         $out[] = [
             'name' => $it['name'], 'is_dir' => $it['is_dir'],
             'size' => $it['size'], 'mtime' => $it['mtime'],
             'cat' => $cat, 'icon' => $icon, 'path' => $rp,
             'has_media' => $hasMedia,
+            'view' => $viewMode ?: null,
         ];
     }
     // Also compute hash for future comparisons
@@ -820,6 +843,70 @@ if ($action === 'api_detail') {
         $result['detail'] = ($docExt === 'pdf') ? get_pdf_info($abs) : get_document_info($abs);
     }
     echo json_encode($result);
+    exit;
+}
+
+// --- API: stream file inline (for in-browser viewing) ---
+if ($action === 'api_stream') {
+    list(, $abs) = resolve_requested_path($requested);
+    if (!$abs || !is_file($abs) || !is_readable($abs)) {
+        header($_SERVER["SERVER_PROTOCOL"] . " 404 Not Found");
+        echo "File not found."; exit;
+    }
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime = finfo_file($finfo, $abs) ?: 'application/octet-stream';
+    finfo_close($finfo);
+    $ext = strtolower(pathinfo($abs, PATHINFO_EXTENSION));
+    // Override MIME for known types that browsers handle well
+    $mimeOverrides = [
+        'mp4'=>'video/mp4','webm'=>'video/webm','ogv'=>'video/ogg','mov'=>'video/mp4',
+        'mp3'=>'audio/mpeg','ogg'=>'audio/ogg','wav'=>'audio/wav','flac'=>'audio/flac',
+        'm4a'=>'audio/mp4','opus'=>'audio/ogg','aac'=>'audio/aac',
+        'pdf'=>'application/pdf',
+        'svg'=>'image/svg+xml','webp'=>'image/webp','avif'=>'image/avif',
+        'txt'=>'text/plain','md'=>'text/plain','log'=>'text/plain','csv'=>'text/csv',
+        'json'=>'application/json','xml'=>'text/xml',
+        'html'=>'text/html','css'=>'text/css','js'=>'text/javascript',
+    ];
+    if (isset($mimeOverrides[$ext])) $mime = $mimeOverrides[$ext];
+    $size = filesize($abs);
+    // Support HTTP Range requests for video/audio seeking
+    $start = 0;
+    $end = $size - 1;
+    $statusCode = 200;
+    if (isset($_SERVER['HTTP_RANGE'])) {
+        if (preg_match('/bytes=(\d*)-(\d*)/', $_SERVER['HTTP_RANGE'], $m)) {
+            $start = $m[1] !== '' ? (int)$m[1] : 0;
+            $end = $m[2] !== '' ? min((int)$m[2], $size - 1) : $size - 1;
+            if ($start > $end || $start >= $size) {
+                header($_SERVER["SERVER_PROTOCOL"] . " 416 Range Not Satisfiable");
+                header("Content-Range: bytes */$size");
+                exit;
+            }
+            $statusCode = 206;
+            header($_SERVER["SERVER_PROTOCOL"] . " 206 Partial Content");
+            header("Content-Range: bytes $start-$end/$size");
+        }
+    }
+    header('Content-Type: ' . $mime);
+    header('Content-Length: ' . ($end - $start + 1));
+    header('Content-Disposition: inline; filename="' . rawurlencode(basename($abs)) . '"');
+    header('Accept-Ranges: bytes');
+    header('Cache-Control: public, max-age=3600');
+    if ($statusCode === 200) {
+        header($_SERVER["SERVER_PROTOCOL"] . " 200 OK");
+    }
+    while (ob_get_level()) ob_end_flush();
+    $fp = fopen($abs, 'rb');
+    if ($start > 0) fseek($fp, $start);
+    $remaining = $end - $start + 1;
+    while ($remaining > 0 && !feof($fp)) {
+        $chunk = fread($fp, min(8192, $remaining));
+        echo $chunk;
+        $remaining -= strlen($chunk);
+        flush();
+    }
+    fclose($fp);
     exit;
 }
 
@@ -1143,6 +1230,30 @@ a:visited{color:var(--accent)}
 .cookie-banner .cb-text{flex:1;min-width:200px;text-align:left}
 .cookie-banner .cb-btn{background:var(--accent);color:#fff;border:none;padding:5px 16px;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;white-space:nowrap}
 .cookie-banner .cb-btn:hover{opacity:0.9}
+/* Media viewer modal */
+.viewer-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:30000;background:rgba(0,0,0,0.85);align-items:center;justify-content:center;flex-direction:column}
+.viewer-overlay.active{display:flex}
+.viewer-header{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(rgba(0,0,0,0.7),transparent);z-index:1;color:#fff;font-size:14px}
+.viewer-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px;font-weight:500}
+.viewer-actions{display:flex;gap:8px;flex-shrink:0}
+.viewer-btn{background:rgba(255,255,255,0.15);border:1px solid rgba(255,255,255,0.2);color:#fff;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:13px;text-decoration:none;white-space:nowrap;backdrop-filter:blur(4px)}
+.viewer-btn:hover{background:rgba(255,255,255,0.25)}
+.viewer-btn.close-btn{font-size:20px;padding:2px 10px;line-height:1}
+.viewer-content{display:flex;align-items:center;justify-content:center;width:100%;height:100%;padding:50px 16px 16px}
+.viewer-content video,.viewer-content audio{max-width:95vw;max-height:85vh;border-radius:8px;outline:none}
+.viewer-content video{background:#000}
+.viewer-content audio{min-width:min(400px,90vw)}
+.viewer-content img{max-width:95vw;max-height:85vh;object-fit:contain;border-radius:4px;cursor:zoom-in}
+.viewer-content img.zoomed{max-width:none;max-height:none;cursor:zoom-out}
+.viewer-content iframe{width:95vw;height:85vh;border:none;border-radius:8px;background:#fff}
+.viewer-content pre{max-width:95vw;max-height:85vh;overflow:auto;background:var(--card);color:var(--text);padding:20px;border-radius:8px;font-size:13px;white-space:pre-wrap;word-break:break-all;margin:0}
+.viewer-content .viewer-error{color:var(--muted);font-size:15px;text-align:center;padding:40px}
+/* Nav arrows for image galleries */
+.viewer-nav{position:absolute;top:50%;transform:translateY(-50%);background:rgba(255,255,255,0.1);border:none;color:#fff;font-size:28px;padding:12px 16px;cursor:pointer;border-radius:8px;z-index:2;backdrop-filter:blur(4px)}
+.viewer-nav:hover{background:rgba(255,255,255,0.2)}
+.viewer-nav.prev{left:12px}
+.viewer-nav.next{right:12px}
+.viewer-nav:disabled{opacity:0.2;cursor:default}
 </style>
 </head>
 <body>
@@ -1211,6 +1322,7 @@ a:visited{color:var(--accent)}
         $icon = $it['is_dir'] ? '📁' : file_icon($it['name']);
         $relPath = $currentRel === '' ? $it['name'] : ($currentRel.'/'.$it['name']);
         $hasMedia = in_array($cat, ['image','audio','video','document']);
+        $viewMode = $it['is_dir'] ? false : file_view_mode($it['name']);
       ?>
         <tr data-isdir="<?php echo $it['is_dir']?'1':'0'; ?>"
             data-name="<?php echo htmlspecialchars($it['name']); ?>"
@@ -1219,14 +1331,18 @@ a:visited{color:var(--accent)}
             data-info="<?php echo $it['is_dir'] ? '50000' : '0'; ?>"
             data-cat="<?php echo $cat; ?>"
             data-path="<?php echo htmlspecialchars($relPath); ?>"
-            <?php if ($hasMedia): ?>data-media="1"<?php endif; ?>>
+            <?php if ($hasMedia): ?>data-media="1"<?php endif; ?>
+            <?php if ($viewMode): ?>data-view="<?php echo $viewMode; ?>"<?php endif; ?>>
           <td>
             <div class="namecell">
               <span class="icon"><?php echo $icon; ?></span>
               <?php if ($it['is_dir']): ?>
                 <a href="?<?php echo http_build_query(['path'=>$relPath]); ?>"><?php echo safe_basename($it['name']); ?></a>
               <?php else: ?>
-                <a href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'download']); ?>"><?php echo safe_basename($it['name']); ?></a>
+                <a href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'download']); ?>"
+                   <?php if ($viewMode === 'modal'): ?>onclick="return openViewer(this)"<?php endif; ?>
+                   <?php if ($viewMode === 'tab'): ?>onclick="return openInTab(this)"<?php endif; ?>
+                ><?php echo safe_basename($it['name']); ?></a>
               <?php endif; ?>
             </div>
           </td>
@@ -1236,6 +1352,11 @@ a:visited{color:var(--accent)}
           <td>
             <div class="actions">
               <?php if (!$it['is_dir']): ?>
+                <?php if ($viewMode === 'modal'): ?>
+                  <a class="btn" href="#" onclick="return openViewerByPath('<?php echo htmlspecialchars($relPath, ENT_QUOTES); ?>')">View</a>
+                <?php elseif ($viewMode === 'tab'): ?>
+                  <a class="btn" href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'api_stream']); ?>" target="_blank">View</a>
+                <?php endif; ?>
                 <a class="btn" href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'download']); ?>">Download</a>
               <?php else: ?>
                 <a class="btn" href="?<?php echo http_build_query(['path'=>$relPath]); ?>">Open</a>
@@ -1248,6 +1369,21 @@ a:visited{color:var(--accent)}
     </tbody>
   </table>
   <?php endif; ?>
+</div>
+
+<!-- Media viewer overlay -->
+<div class="viewer-overlay" id="viewerOverlay">
+  <div class="viewer-header">
+    <span class="viewer-title" id="viewerTitle"></span>
+    <div class="viewer-actions">
+      <a class="viewer-btn" id="viewerDownload" href="#" download>⤓ Download</a>
+      <a class="viewer-btn" id="viewerNewTab" href="#" target="_blank">↗ New Tab</a>
+      <button class="viewer-btn close-btn" id="viewerClose" title="Close (Esc)">✕</button>
+    </div>
+  </div>
+  <button class="viewer-nav prev" id="viewerPrev" title="Previous">‹</button>
+  <button class="viewer-nav next" id="viewerNext" title="Next">›</button>
+  <div class="viewer-content" id="viewerContent"></div>
 </div>
 
 <div class="cookie-banner" id="cookieBanner">
@@ -1800,14 +1936,19 @@ function buildRowHTML(it, scriptName){
   var safeName = esc(it.name);
   var rp = encodeURIComponent(it.path).replace(/%2F/gi,'/');
   var pathQ = 'path='+encodeURIComponent(it.path);
+  var vm = it.view || (it.is_dir ? null : getViewMode(it.name));
   var h = '<tr data-isdir="'+(it.is_dir?'1':'0')+'" data-name="'+esc(it.name)+'" data-size="'+it.size+'" data-mtime="'+it.mtime+'" data-info="'+(it.is_dir?'50000':'0')+'" data-cat="'+it.cat+'" data-path="'+esc(it.path)+'"';
   if(it.has_media) h += ' data-media="1"';
+  if(vm) h += ' data-view="'+vm+'"';
   h += '>';
   h += '<td><div class="namecell"><span class="icon">'+it.icon+'</span>';
   if(it.is_dir){
     h += '<a href="?'+pathQ+'">'+safeName+'</a>';
   } else {
-    h += '<a href="?'+pathQ+'&action=download">'+safeName+'</a>';
+    h += '<a href="?'+pathQ+'&action=download"';
+    if(vm==='modal') h += ' onclick="return openViewer(this)"';
+    else if(vm==='tab') h += ' onclick="return openInTab(this)"';
+    h += '>'+safeName+'</a>';
   }
   h += '</div></td>';
   h += '<td class="small size-cell">';
@@ -1821,6 +1962,8 @@ function buildRowHTML(it, scriptName){
   h += '<td class="small">'+formatDateJS(it.mtime)+'</td>';
   h += '<td><div class="actions">';
   if(!it.is_dir){
+    if(vm==='modal') h += '<a class="btn" href="#" onclick="return openViewerByPath(\''+esc(it.path).replace(/'/g,"\\'")+'\')">View</a>';
+    else if(vm==='tab') h += '<a class="btn" href="?'+pathQ+'&action=api_stream" target="_blank">View</a>';
     h += '<a class="btn" href="?'+pathQ+'&action=download">Download</a>';
   } else {
     h += '<a class="btn" href="?'+pathQ+'">Open</a>';
@@ -1995,6 +2138,172 @@ function wireRowHandlers(row){
     }
   }
 }
+
+// =========== MEDIA VIEWER ===========
+var viewerOverlay = document.getElementById('viewerOverlay');
+var viewerContent = document.getElementById('viewerContent');
+var viewerTitle = document.getElementById('viewerTitle');
+var viewerDownload = document.getElementById('viewerDownload');
+var viewerNewTab = document.getElementById('viewerNewTab');
+var viewerClose = document.getElementById('viewerClose');
+var viewerPrev = document.getElementById('viewerPrev');
+var viewerNext = document.getElementById('viewerNext');
+var viewerCurrentPath = null;
+var viewerSiblings = []; // list of viewable paths in current directory for nav
+
+function getViewMode(name){
+  var ext = name.split('.').pop().toLowerCase();
+  var modal = ['mp4','webm','ogv','mov','mp3','ogg','wav','flac','m4a','opus','aac',
+    'jpg','jpeg','png','gif','bmp','svg','webp','ico','avif',
+    'txt','md','log','csv','json','xml','html','css','js','py','php','sh','c','cpp','h','java','rs','go','rb','ts'];
+  var tab = ['pdf'];
+  if(modal.indexOf(ext) !== -1) return 'modal';
+  if(tab.indexOf(ext) !== -1) return 'tab';
+  return false;
+}
+
+function getFileType(name){
+  var ext = name.split('.').pop().toLowerCase();
+  if(['mp4','webm','ogv','mov'].indexOf(ext)!==-1) return 'video';
+  if(['mp3','ogg','wav','flac','m4a','opus','aac'].indexOf(ext)!==-1) return 'audio';
+  if(['jpg','jpeg','png','gif','bmp','svg','webp','ico','avif'].indexOf(ext)!==-1) return 'image';
+  if(ext==='pdf') return 'pdf';
+  return 'text';
+}
+
+function streamUrl(path){ return '?'+new URLSearchParams({action:'api_stream',path:path}); }
+function downloadUrl(path){ return '?'+new URLSearchParams({action:'download',path:path}); }
+
+function collectViewableSiblings(){
+  var list = [];
+  getRows().forEach(function(r){
+    if(r.dataset.isdir==='1' || r.classList.contains('hidden')) return;
+    var vm = r.dataset.view;
+    if(vm === 'modal') list.push(r.dataset.path);
+  });
+  return list;
+}
+
+function showViewer(path){
+  var name = path.split('/').pop();
+  var type = getFileType(name);
+  var url = streamUrl(path);
+
+  viewerCurrentPath = path;
+  viewerTitle.textContent = name;
+  viewerDownload.href = downloadUrl(path);
+  viewerNewTab.href = url;
+  viewerContent.innerHTML = '';
+
+  if(type === 'video'){
+    var v = document.createElement('video');
+    v.controls = true; v.autoplay = true; v.src = url;
+    v.setAttribute('preload','metadata');
+    viewerContent.appendChild(v);
+  } else if(type === 'audio'){
+    var a = document.createElement('audio');
+    a.controls = true; a.autoplay = true; a.src = url;
+    viewerContent.appendChild(a);
+  } else if(type === 'image'){
+    var img = document.createElement('img');
+    img.src = url; img.alt = name;
+    img.addEventListener('click', function(){ img.classList.toggle('zoomed'); });
+    viewerContent.appendChild(img);
+  } else if(type === 'pdf'){
+    var ifr = document.createElement('iframe');
+    ifr.src = url;
+    viewerContent.appendChild(ifr);
+  } else {
+    // Text/code: fetch and display in <pre>
+    var pre = document.createElement('pre');
+    pre.textContent = 'Loading…';
+    viewerContent.appendChild(pre);
+    fetch(url).then(function(r){
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      var ct = r.headers.get('content-length');
+      // Limit text preview to ~2MB
+      if(ct && parseInt(ct) > 2*1024*1024){
+        pre.textContent = 'File too large for text preview. Use "New Tab" or download.';
+        return;
+      }
+      return r.text();
+    }).then(function(t){
+      if(t !== undefined) pre.textContent = t;
+    }).catch(function(){
+      pre.textContent = 'Could not load file.';
+    });
+  }
+
+  // Nav buttons
+  viewerSiblings = collectViewableSiblings();
+  updateNavButtons();
+
+  viewerOverlay.classList.add('active');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeViewer(){
+  viewerOverlay.classList.remove('active');
+  document.body.style.overflow = '';
+  // Stop any playing media
+  var v = viewerContent.querySelector('video');
+  var a = viewerContent.querySelector('audio');
+  if(v){ v.pause(); v.src=''; }
+  if(a){ a.pause(); a.src=''; }
+  viewerContent.innerHTML = '';
+  viewerCurrentPath = null;
+}
+
+function updateNavButtons(){
+  var idx = viewerSiblings.indexOf(viewerCurrentPath);
+  viewerPrev.style.display = viewerSiblings.length > 1 ? '' : 'none';
+  viewerNext.style.display = viewerSiblings.length > 1 ? '' : 'none';
+  viewerPrev.disabled = idx <= 0;
+  viewerNext.disabled = idx >= viewerSiblings.length - 1;
+}
+
+function navigateViewer(delta){
+  var idx = viewerSiblings.indexOf(viewerCurrentPath);
+  var newIdx = idx + delta;
+  if(newIdx >= 0 && newIdx < viewerSiblings.length){
+    showViewer(viewerSiblings[newIdx]);
+  }
+}
+
+viewerClose.addEventListener('click', closeViewer);
+viewerPrev.addEventListener('click', function(){ navigateViewer(-1); });
+viewerNext.addEventListener('click', function(){ navigateViewer(1); });
+viewerOverlay.addEventListener('click', function(e){
+  // Close when clicking backdrop (not content)
+  if(e.target === viewerOverlay || e.target === viewerContent) closeViewer();
+});
+
+document.addEventListener('keydown', function(e){
+  if(!viewerOverlay.classList.contains('active')) return;
+  if(e.key === 'Escape') closeViewer();
+  else if(e.key === 'ArrowLeft') navigateViewer(-1);
+  else if(e.key === 'ArrowRight') navigateViewer(1);
+});
+
+// Global functions called from onclick handlers
+window.openViewer = function(anchor){
+  var row = anchor.closest('tr');
+  if(!row) return true;
+  showViewer(row.dataset.path);
+  return false;
+};
+
+window.openViewerByPath = function(path){
+  showViewer(path);
+  return false;
+};
+
+window.openInTab = function(anchor){
+  var row = anchor.closest('tr');
+  if(!row) return true;
+  window.open(streamUrl(row.dataset.path), '_blank');
+  return false;
+};
 
 setInterval(refreshDirectory, 10000);
 
