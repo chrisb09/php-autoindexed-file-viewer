@@ -34,7 +34,8 @@ RUN mkdir -p /app/.cache_fb && chown -R www-data:www-data /app/.cache_fb
 WORKDIR /app
 
 # Copy application files
-COPY --chown=www-data:www-data . .
+#COPY --chown=www-data:www-data . .
+COPY --chown=www-data:www-data index.php ./
 
 # Ensure files directory exists
 RUN mkdir -p /app/files && chown -R www-data:www-data /app/files

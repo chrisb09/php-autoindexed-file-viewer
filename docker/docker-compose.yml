@@ -7,7 +7,7 @@ services:
     container_name: php-autoindexed-file-viewer
     volumes:
       # Mount files directory for persistence
-      - ../files:/app/files
+      - ./files:/app/files
       # Mount cache directory for persistence
       - file_browser_cache:/app/.cache_fb
       # Optional: Mount folders you have symbolically linked to

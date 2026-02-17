@@ -6,3 +6,4 @@ files/
 gen_favicon_header.py
 logo/
 !logo/256.png
+i18n_output.php
