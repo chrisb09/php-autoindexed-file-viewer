@@ -7493,8 +7493,7 @@ window.sharePath = function(path) {
       .then(data => {
         if (data.ok) {
           const baseUrl = window.location.href.split('?')[0].split('#')[0];
-          const shareBase = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1) + 's/';
-          const fullUrl = shareBase + data.token;
+          const fullUrl = baseUrl + '?s=' + data.token;
           
           closeShare();
           
