@@ -4,7 +4,7 @@ set_time_limit(0);
 ignore_user_abort(true);
 
 // --- VERSION ---
-define('APP_VERSION', '0.4.0');
+define('APP_VERSION', '0.5.0');
 
 // --- I18N ---
 // Language definitions: each key is a locale code.
@@ -61,6 +61,14 @@ $I18N = [
         'folder_singular' => '{n} folder',
         'folder_plural' => '{n} folders',
         'empty' => 'empty',
+        'share' => 'Share',
+        'share_copied' => 'Share link copied to clipboard!',
+        'share_expires' => 'Expiration:',
+        'share_never' => 'Never',
+        'share_1h' => '1 hour',
+        'share_1d' => '1 day',
+        'share_7d' => '7 days',
+        'share_30d' => '30 days',
         'background_tasks' => 'Background tasks',
         'info_format' => 'Format',
         'info_pages' => 'Pages',
@@ -4696,6 +4704,11 @@ function safe_basename($path) {
     return htmlspecialchars(basename($path), ENT_QUOTES|ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function u($params) {
+    global $SHARE_QUERY;
+    return '?' . http_build_query(array_merge($SHARE_QUERY, $params));
+}
+
 function list_directory($path) {
     global $BASE_DIR;
     $items = [];
@@ -5367,6 +5380,50 @@ function task_execute($type, $path) {
 $action = $_GET['action'] ?? '';
 $requested = $_GET['path'] ?? '';
 
+// --- Handle Share Token ---
+$SHARE_TOKEN = $_GET['s'] ?? '';
+$SHARE_QUERY = [];
+if ($SHARE_TOKEN) {
+    $shareDb = get_share_db();
+    $stmt = $shareDb->prepare('SELECT path, is_dir, expires_at FROM shares WHERE token = :t');
+    $stmt->bindValue(':t', $SHARE_TOKEN, SQLITE3_TEXT);
+    $share = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    $shareDb->close();
+
+    if ($share) {
+        if ($share['expires_at'] && $share['expires_at'] < time()) {
+            header($_SERVER["SERVER_PROTOCOL"] . " 403 Forbidden");
+            die("Share link has expired.");
+        }
+        $SHARE_QUERY = ['s' => $SHARE_TOKEN];
+        $absShared = realpath(__DIR__ . '/files/' . $share['path']);
+        if ($absShared && file_exists($absShared)) {
+            if ($share['is_dir']) {
+                $BASE_DIR = $absShared;
+            } else {
+                // Shared a single file
+                if ($requested !== '' && $requested !== basename($absShared)) {
+                    header($_SERVER["SERVER_PROTOCOL"] . " 403 Forbidden");
+                    die("Access denied.");
+                }
+                $BASE_DIR = dirname($absShared);
+                $requested = basename($absShared);
+                
+                // If it's a file share and no specific action is requested, serve it immediately
+                if ($_GET['path'] === '' && $action === '') {
+                    log_download($share['path']);
+                    send_file_response($absShared);
+                }
+            }
+        } else {
+            die("Shared path no longer exists.");
+        }
+    } else {
+        header($_SERVER["SERVER_PROTOCOL"] . " 403 Forbidden");
+        die("Invalid or expired share link.");
+    }
+}
+
 // --- API: enqueue tasks (POST) ---
 if ($action === 'api_enqueue') {
     header('Content-Type: application/json');
@@ -5685,6 +5742,29 @@ if ($action === 'api_dlcounts') {
     exit;
 }
 
+// --- API: create share link ---
+if ($action === 'api_share_create') {
+    header('Content-Type: application/json');
+    $path = $_GET['path'] ?? '';
+    $hours = (int)($_GET['expires'] ?? 0);
+    list($rel, $abs) = resolve_requested_path($path);
+    if ($abs === false) { echo json_encode(['error' => 'Invalid path']); exit; }
+
+    $token = bin2hex(random_bytes(16));
+    $db = get_share_db();
+    $stmt = $db->prepare('INSERT INTO shares (token, path, is_dir, created_at, expires_at) VALUES (:t, :p, :d, :c, :e)');
+    $stmt->bindValue(':t', $token, SQLITE3_TEXT);
+    $stmt->bindValue(':p', $rel, SQLITE3_TEXT);
+    $stmt->bindValue(':d', is_dir($abs) ? 1 : 0, SQLITE3_INTEGER);
+    $stmt->bindValue(':c', time(), SQLITE3_INTEGER);
+    $stmt->bindValue(':e', $hours > 0 ? time() + ($hours * 3600) : null, SQLITE3_INTEGER);
+    $stmt->execute();
+    $db->close();
+
+    echo json_encode(['ok' => true, 'token' => $token]);
+    exit;
+}
+
 function generate_image_thumbnail($srcPath, $dstPath) {
     global $THUMB_MAX_DIM;
     $maxDim = $THUMB_MAX_DIM ?: 240;
@@ -5861,6 +5941,22 @@ function get_document_info($filePath) {
     return $result;
 }
 
+// --- Share-by-link ---
+function get_share_db() {
+    global $CACHE_DIR;
+    $dbPath = $CACHE_DIR . '/shares.sqlite';
+    $db = new SQLite3($dbPath);
+    $db->busyTimeout(2000);
+    $db->exec('CREATE TABLE IF NOT EXISTS shares (
+        token TEXT PRIMARY KEY,
+        path TEXT NOT NULL,
+        is_dir INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER
+    )');
+    return $db;
+}
+
 // --- Download/access logging ---
 function get_log_db() {
     global $CACHE_DIR;
@@ -5966,7 +6062,7 @@ if ($action === 'download') {
 // --- Directory listing page ---
 if (!file_exists($absRequested)) { header($_SERVER["SERVER_PROTOCOL"]." 404 Not Found"); echo "Not found."; exit; }
 if (!is_dir($absRequested)) {
-    header('Location: ?'.http_build_query(['path'=>$requested,'action'=>'download'])); exit;
+    header('Location: '.u(['path'=>$requested,'action'=>'download'])); exit;
 }
 
 $items = list_directory($absRequested);
@@ -6099,6 +6195,8 @@ a:visited{color:var(--accent)}
 /* Media viewer modal */
 .viewer-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:30000;background:rgba(0,0,0,0.85);align-items:center;justify-content:center;flex-direction:column}
 .viewer-overlay.active{display:flex}
+.share-box{background:var(--bg);border:1px solid var(--border);padding:25px;border-radius:8px;max-width:400px;width:90%;box-shadow:0 10px 40px rgba(0,0,0,0.5)}
+.share-box h3{margin-top:0;margin-bottom:10px}
 .viewer-header{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(rgba(0,0,0,0.7),transparent);z-index:1;color:#fff;font-size:14px}
 .viewer-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px;font-weight:500}
 .viewer-actions{display:flex;gap:8px;flex-shrink:0}
@@ -6156,8 +6254,8 @@ a:visited{color:var(--accent)}
     <div class="title"><?php echo t('title'); ?> v<?php echo APP_VERSION; ?></div>
     <div class="toolbar">
       <span class="queue-status" id="queueStatus" title="<?php echo t('background_tasks'); ?>"><span id="queueStatusText"></span><div class="queue-detail-popup" id="queueDetailPopup"></div></span>
-      <a class="btn" href="?<?php echo http_build_query(['path'=>$currentRel,'action'=>'download']); ?>" title="<?php echo t('download_folder'); ?>"><?php echo t('download_folder'); ?></a>
-      <a class="btn" href="<?php echo $scriptName; ?>"><?php echo t('home'); ?></a>
+      <a class="btn" href="<?php echo u(['path'=>$currentRel,'action'=>'download']); ?>" title="<?php echo t('download_folder'); ?>"><?php echo t('download_folder'); ?></a>
+      <a class="btn" href="<?php echo $SHARE_TOKEN ? u(['path'=>'']) : $scriptName; ?>"><?php echo t('home'); ?></a>
       <div class="lang-dropdown-wrapper">
         <button class="lang-select" id="langSelect" title="Language"><?php echo $I18N[$CURRENT_LANG]['_flag'] . ' ' . $I18N[$CURRENT_LANG]['_name']; ?></button>
         <div class="lang-dropdown-menu" id="langDropdownMenu">
@@ -6176,7 +6274,7 @@ a:visited{color:var(--accent)}
       <?php if ($i === count($crumbs)-1): ?>
         <span><?php echo htmlspecialchars($c['name']); ?></span>
       <?php else: ?>
-        <a href="?<?php echo http_build_query(['path'=>$c['path']]); ?>"><?php echo htmlspecialchars($c['name']); ?></a>
+        <a href="<?php echo u(['path'=>$c['path']]); ?>"><?php echo htmlspecialchars($c['name']); ?></a>
       <?php endif; ?>
     <?php endforeach; ?>
   </div>
@@ -6217,7 +6315,7 @@ a:visited{color:var(--accent)}
             $parent = dirname($currentRel);
             if ($parent === '.') $parent = '';
             echo '<tr data-isdir="1" data-name="" data-size="-1" data-mtime="0" data-info="-1" data-cat="folder" class="parentrow">';
-            echo '<td><div class="namecell"><span class="icon">↰</span><a href="?'.http_build_query(['path'=>$parent]).'">'.t('parent_folder').'</a></div></td>';
+            echo '<td><div class="namecell"><span class="icon">↰</span><a href="'.u(['path'=>$parent]).'">'.t('parent_folder').'</a></div></td>';
             echo '<td class="small"></td><td class="info-cell"></td><td class="small"></td><td></td>';
             echo '</tr>';
         }
@@ -6242,9 +6340,9 @@ a:visited{color:var(--accent)}
             <div class="namecell">
               <span class="icon"><?php echo $icon; ?></span>
               <?php if ($it['is_dir']): ?>
-                <a href="?<?php echo http_build_query(['path'=>$relPath]); ?>"><?php echo safe_basename($it['name']); ?></a>
+                <a href="<?php echo u(['path'=>$relPath]); ?>"><?php echo safe_basename($it['name']); ?></a>
               <?php else: ?>
-                <a href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'download']); ?>"
+                <a href="<?php echo u(['path'=>$relPath,'action'=>'download']); ?>"
                    <?php if ($viewMode === 'modal'): ?>onclick="return openViewer(this)"<?php endif; ?>
                    <?php if ($viewMode === 'tab'): ?>onclick="return openInTab(this)"<?php endif; ?>
                 ><?php echo safe_basename($it['name']); ?></a>
@@ -6260,12 +6358,15 @@ a:visited{color:var(--accent)}
                 <?php if ($viewMode === 'modal'): ?>
                   <a class="btn" href="#" onclick="return openViewerByPath('<?php echo htmlspecialchars($relPath, ENT_QUOTES); ?>')"><?php echo t('view'); ?></a>
                 <?php elseif ($viewMode === 'tab'): ?>
-                  <a class="btn" href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'api_stream']); ?>" target="_blank"><?php echo t('view'); ?></a>
+                  <a class="btn" href="<?php echo u(['path'=>$relPath,'action'=>'api_stream']); ?>" target="_blank"><?php echo t('view'); ?></a>
                 <?php endif; ?>
-                <a class="btn" href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'download']); ?>"><?php echo t('download'); ?></a>
+                <a class="btn" href="<?php echo u(['path'=>$relPath,'action'=>'download']); ?>"><?php echo t('download'); ?></a>
               <?php else: ?>
-                <a class="btn" href="?<?php echo http_build_query(['path'=>$relPath]); ?>"><?php echo t('open'); ?></a>
-                <a class="btn" href="?<?php echo http_build_query(['path'=>$relPath,'action'=>'download']); ?>"><?php echo t('zip'); ?></a>
+                <a class="btn" href="<?php echo u(['path'=>$relPath]); ?>"><?php echo t('open'); ?></a>
+                <a class="btn" href="<?php echo u(['path'=>$relPath,'action'=>'download']); ?>"><?php echo t('zip'); ?></a>
+              <?php endif; ?>
+              <?php if (!$SHARE_TOKEN): ?>
+                <button class="btn" onclick="sharePath('<?php echo htmlspecialchars($relPath, ENT_QUOTES); ?>')"><?php echo t('share'); ?></button>
               <?php endif; ?>
             </div>
           </td>
@@ -6294,6 +6395,28 @@ a:visited{color:var(--accent)}
 <div class="cookie-banner" id="cookieBanner">
   <span class="cb-text"><?php echo t('cookie_text'); ?></span>
   <button class="cb-btn" id="cookieAccept"><?php echo t('cookie_ok'); ?></button>
+</div>
+
+<!-- Share overlay -->
+<div class="viewer-overlay" id="shareOverlay">
+  <div class="share-box">
+    <h3><?php echo t('share'); ?></h3>
+    <p id="sharePathDisplay" style="word-break:break-all;font-size:13px;color:var(--muted)"></p>
+    <div style="margin:20px 0">
+      <label><?php echo t('share_expires'); ?></label>
+      <select id="shareExpires" class="lang-select" style="width:100%;margin-top:8px">
+        <option value="0"><?php echo t('share_never'); ?></option>
+        <option value="1"><?php echo t('share_1h'); ?></option>
+        <option value="24"><?php echo t('share_1d'); ?></option>
+        <option value="168"><?php echo t('share_7d'); ?></option>
+        <option value="720"><?php echo t('share_30d'); ?></option>
+      </select>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button class="btn" id="shareCancel"><?php echo t('viewer_close'); ?></button>
+      <button class="btn" id="shareConfirm" style="background:var(--accent);color:#fff;border-color:var(--accent)"><?php echo t('share'); ?></button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -6338,6 +6461,12 @@ toggleBtn.addEventListener('click', function(){
 
 // --- I18N (client-side) ---
 var i18n = <?php echo json_encode($I18N[$CURRENT_LANG], JSON_UNESCAPED_UNICODE); ?>;
+var shareToken = '<?php echo $SHARE_TOKEN; ?>';
+function addShare(params) {
+  if (shareToken) params.append('s', shareToken);
+  return params;
+}
+
 // Language selector (custom dropdown)
 var langSelect = document.getElementById('langSelect');
 var langDropdownMenu = document.getElementById('langDropdownMenu');
@@ -6473,7 +6602,7 @@ function doRecursiveSearch(){
   if(!isShowingRecursive){
     originalRows = Array.from(tbody.querySelectorAll('tr'));
   }
-  fetch('?'+new URLSearchParams({action:'api_search',path:folderPath,q:q}))
+  fetch('?'+addShare(new URLSearchParams({action:'api_search',path:folderPath,q:q})))
     .then(function(r){ return r.json(); })
     .then(function(d){
       if(!d.items) return;
@@ -6808,7 +6937,7 @@ document.querySelectorAll('tr[data-media]').forEach(function(row){
       popup.classList.add('active');
       positionFixed(tag, popup);
       activePopup = popup;
-      fetch('?'+new URLSearchParams({action:'api_detail',path:path}))
+      fetch('?'+addShare(new URLSearchParams({action:'api_detail',path:path})))
         .then(function(r){return r.json();})
         .then(function(d){ popup.innerHTML = renderDetail(d); loaded=true; positionFixed(tag, popup); })
         .catch(function(){ popup.innerHTML=(i18n.error_loading||'Error loading info'); });
@@ -6849,7 +6978,7 @@ document.querySelectorAll('tr[data-media]').forEach(function(row){
       thumbPopup.innerHTML = '<span style="padding:8px;color:var(--muted);font-size:12px">'+(i18n.loading||'Loading…')+'</span>';
       thumbPopup.classList.add('active');
       posThumb(nc);
-      fetch('?'+new URLSearchParams({action:'api_thumb',path:path}))
+      fetch('?'+addShare(new URLSearchParams({action:'api_thumb',path:path})))
         .then(function(r){ if(!r.ok) throw 0; return r.blob(); })
         .then(function(bl){ var url=URL.createObjectURL(bl); thumbCache[path]=url; showThumb(url, nc); })
         .catch(function(){ thumbCache[path]=false; thumbPopup.classList.remove('active'); });
@@ -6966,6 +7095,7 @@ function buildRowHTML(it, scriptName){
   var safeName = esc(it.name);
   var rp = encodeURIComponent(it.path).replace(/%2F/gi,'/');
   var pathQ = 'path='+encodeURIComponent(it.path);
+  if (shareToken) pathQ += '&s=' + shareToken;
   var vm = it.view || (it.is_dir ? null : getViewMode(it.name));
   var h = '<tr data-isdir="'+(it.is_dir?'1':'0')+'" data-name="'+esc(it.name)+'" data-size="'+it.size+'" data-mtime="'+it.mtime+'" data-info="'+(it.is_dir?'50000':'0')+'" data-cat="'+it.cat+'" data-path="'+esc(it.path)+'"';
   if(it.has_media) h += ' data-media="1"';
@@ -6999,6 +7129,9 @@ function buildRowHTML(it, scriptName){
     h += '<a class="btn" href="?'+pathQ+'">'+esc(i18n.open)+'</a>';
     h += '<a class="btn" href="?'+pathQ+'&action=download">'+esc(i18n.zip)+'</a>';
   }
+  if (!shareToken) {
+    h += '<button class="btn" onclick="sharePath(\''+esc(it.path).replace(/'/g,"\\'")+'\')">'+esc(i18n.share)+'</button>';
+  }
   h += '</div></td></tr>';
   return h;
 }
@@ -7006,14 +7139,14 @@ function buildRowHTML(it, scriptName){
 function refreshDirectory(){
   if(dirCheckBusy || !table) return;
   dirCheckBusy = true;
-  fetch('?'+new URLSearchParams({action:'api_dircheck',path:dirCheckPath}))
+  fetch('?'+addShare(new URLSearchParams({action:'api_dircheck',path:dirCheckPath})))
     .then(function(r){ return r.json(); })
     .then(function(d){
       if(!d.hash){ dirCheckBusy=false; return; }
       if(dirCheckHash === null){ dirCheckHash = d.hash; dirCheckBusy=false; return; }
       if(d.hash === dirCheckHash){ dirCheckBusy=false; return; }
       // Hash changed — fetch full listing
-      return fetch('?'+new URLSearchParams({action:'api_dirlist',path:dirCheckPath}))
+      return fetch('?'+addShare(new URLSearchParams({action:'api_dirlist',path:dirCheckPath})))
         .then(function(r){ return r.json(); })
         .then(function(data){
           dirCheckHash = data.hash;
@@ -7156,7 +7289,7 @@ function wireRowHandlers(row){
         else if(thumbCache[path] !== false){
           thumbPopup.innerHTML = '<span style="padding:8px;color:var(--muted);font-size:12px">'+(i18n.loading||'Loading…')+'</span>';
           thumbPopup.classList.add('active'); posThumb(nc);
-          fetch('?'+new URLSearchParams({action:'api_thumb',path:path}))
+          fetch('?'+addShare(new URLSearchParams({action:'api_thumb',path:path})))
             .then(function(r){ if(!r.ok) throw 0; return r.blob(); })
             .then(function(bl){ var url=URL.createObjectURL(bl); thumbCache[path]=url; showThumb(url, nc); })
             .catch(function(){ thumbCache[path]=false; thumbPopup.classList.remove('active'); });
@@ -7333,6 +7466,52 @@ window.openInTab = function(anchor){
   if(!row) return true;
   window.open(streamUrl(row.dataset.path), '_blank');
   return false;
+};
+
+window.sharePath = function(path) {
+  var overlay = document.getElementById('shareOverlay');
+  var pathDisplay = document.getElementById('sharePathDisplay');
+  var confirmBtn = document.getElementById('shareConfirm');
+  var cancelBtn = document.getElementById('shareCancel');
+  var expiresSelect = document.getElementById('shareExpires');
+  
+  pathDisplay.textContent = path;
+  overlay.classList.add('active');
+  
+  function closeShare() {
+    overlay.classList.remove('active');
+    confirmBtn.onclick = null;
+    cancelBtn.onclick = null;
+  }
+  
+  cancelBtn.onclick = closeShare;
+  
+  confirmBtn.onclick = function() {
+    var expires = expiresSelect.value;
+    fetch('?action=api_share_create&path=' + encodeURIComponent(path) + '&expires=' + expires)
+      .then(r => r.json())
+      .then(data => {
+        if (data.ok) {
+          const baseUrl = window.location.href.split('?')[0].split('#')[0];
+          const shareBase = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1) + 's/';
+          const fullUrl = shareBase + data.token;
+          
+          closeShare();
+          
+          if (navigator.clipboard) {
+            navigator.clipboard.writeText(fullUrl).then(() => {
+              alert('<?php echo t("share_copied"); ?>\n\n' + fullUrl);
+            }).catch(() => {
+              prompt('Copy share link:', fullUrl);
+            });
+          } else {
+            prompt('Copy share link:', fullUrl);
+          }
+        } else {
+          alert('Error: ' + (data.error || 'Unknown error'));
+        }
+      });
+  };
 };
 
 setInterval(refreshDirectory, 10000);
