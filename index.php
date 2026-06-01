@@ -4,7 +4,7 @@ set_time_limit(0);
 ignore_user_abort(true);
 
 // --- VERSION ---
-define('APP_VERSION', '0.5.0');
+define('APP_VERSION', '0.5.1');
 
 // --- I18N ---
 // Language definitions: each key is a locale code.
@@ -6662,6 +6662,7 @@ function updateStatusUI(status){
 
 // Collect all tasks needed for this page and batch-enqueue them
 function collectAndEnqueue(){
+  if (shareToken) return;
   var tasks = [];
 
   // Folder sizes (lowest priority — enqueued first, so they sit at bottom of stack)
@@ -6695,7 +6696,7 @@ function collectAndEnqueue(){
   if(tasks.length === 0) return;
 
   // Enqueue all at once
-  fetch('?action=api_enqueue', {
+  fetch('?'+addShare(new URLSearchParams({action:'api_enqueue'})), {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({tasks:tasks})
@@ -6727,7 +6728,7 @@ function stopWorkLoop(){
 function doWork(){
   if(working) return;
   working = true;
-  fetch('?action=api_work')
+  fetch('?'+addShare(new URLSearchParams({action:'api_work'})))
     .then(function(r){ return r.json(); })
     .then(function(d){
       working = false;
@@ -6750,7 +6751,7 @@ function pollResults(){
   }
   if(waiting.length === 0){ stopWorkLoop(); return Promise.resolve(); }
 
-  return fetch('?action=api_poll', {
+  return fetch('?'+addShare(new URLSearchParams({action:'api_poll'})), {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({waiting:waiting})
@@ -6830,7 +6831,7 @@ function loadDownloadCounts(){
     if(r.dataset.isdir === '0') paths.push(r.dataset.path);
   });
   if(paths.length === 0) return;
-  fetch('?action=api_dlcounts', {
+  fetch('?'+addShare(new URLSearchParams({action:'api_dlcounts'})), {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({paths:paths})
@@ -6868,9 +6869,9 @@ queueStatusEl.addEventListener('mouseleave', function(){
 });
 
 function loadQueueDetail(){
-  if(queueDetailLoading) return;
+  if (shareToken || queueDetailLoading) return;
   queueDetailLoading = true;
-  fetch('?action=api_queue_detail')
+  fetch('?'+addShare(new URLSearchParams({action:'api_queue_detail'})))
     .then(function(r){ return r.json(); })
     .then(function(d){
       queueDetailLoading = false;
@@ -7207,7 +7208,7 @@ function applyDirectoryUpdate(items){
   sortTable(currentSort, currentDir);
 
   // Enqueue tasks for new items
-  if(needsEnqueue.length > 0){
+  if(!shareToken && needsEnqueue.length > 0){
     var tasks = [];
     needsEnqueue.forEach(function(it){
       if(it.is_dir){
@@ -7237,7 +7238,7 @@ function applyDirectoryUpdate(items){
       }
     });
     if(tasks.length > 0){
-      fetch('?action=api_enqueue', {
+      fetch('?'+addShare(new URLSearchParams({action:'api_enqueue'})), {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({tasks:tasks})
@@ -7263,7 +7264,7 @@ function wireRowHandlers(row){
         popup.classList.add('active');
         positionFixed(tag, popup);
         activePopup = popup;
-        fetch('?'+new URLSearchParams({action:'api_detail',path:tag.dataset.path}))
+        fetch('?'+addShare(new URLSearchParams({action:'api_detail',path:tag.dataset.path})))
           .then(function(r){return r.json();})
           .then(function(d){ popup.innerHTML = renderDetail(d); loaded=true; positionFixed(tag, popup); })
           .catch(function(){ popup.innerHTML=(i18n.error_loading||'Error loading info'); });
@@ -7334,8 +7335,8 @@ function getFileType(name){
   return 'text';
 }
 
-function streamUrl(path){ return '?'+new URLSearchParams({action:'api_stream',path:path}); }
-function downloadUrl(path){ return '?'+new URLSearchParams({action:'download',path:path}); }
+function streamUrl(path){ return '?'+addShare(new URLSearchParams({action:'api_stream',path:path})); }
+function downloadUrl(path){ return '?'+addShare(new URLSearchParams({action:'download',path:path})); }
 
 function collectViewableSiblings(){
   var list = [];
@@ -7488,7 +7489,7 @@ window.sharePath = function(path) {
   
   confirmBtn.onclick = function() {
     var expires = expiresSelect.value;
-    fetch('?action=api_share_create&path=' + encodeURIComponent(path) + '&expires=' + expires)
+    fetch('?'+addShare(new URLSearchParams({action:'api_share_create',path:path,expires:expires})))
       .then(r => r.json())
       .then(data => {
         if (data.ok) {
