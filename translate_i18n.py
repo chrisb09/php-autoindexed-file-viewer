@@ -64,6 +64,14 @@ EN_STRINGS = {
     "folder_singular": "{n} folder",
     "folder_plural": "{n} folders",
     "empty": "empty",
+    "share": "Share",
+    "share_copied": "Share link copied to clipboard!",
+    "share_expires": "Expiration:",
+    "share_never": "Never",
+    "share_1h": "1 hour",
+    "share_1d": "1 day",
+    "share_7d": "7 days",
+    "share_30d": "30 days",
     "background_tasks": "Background tasks",
     "info_format": "Format",
     "info_pages": "Pages",
@@ -175,8 +183,8 @@ def strip_thinking(text: str) -> str:
     return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
 
 
-def translate(lang_code: str) -> dict:
-    """Call OpenAI to translate EN_STRINGS into the given language. Returns dict."""
+def translate(lang_code: str, strings_to_translate: dict) -> dict:
+    """Call OpenAI to translate a subset of EN_STRINGS into the given language. Returns dict."""
     lang_name, _, native_name, _, _ = LANGUAGES[lang_code]
     prompt = SYSTEM_PROMPT.format(lang_name=lang_name, native_name=native_name)
 
@@ -185,7 +193,7 @@ def translate(lang_code: str) -> dict:
         temperature=0,
         messages=[
             {"role": "system", "content": prompt},
-            {"role": "user", "content": json.dumps(EN_STRINGS, ensure_ascii=False)},
+            {"role": "user", "content": json.dumps(strings_to_translate, ensure_ascii=False)},
         ],
     )
     text = resp.choices[0].message.content.strip()
@@ -197,6 +205,36 @@ def translate(lang_code: str) -> dict:
         if text.endswith("```"):
             text = text[: text.rfind("```")]
     return json.loads(text)
+
+
+def load_existing_translations(index_php_path: str) -> dict[str, dict]:
+    """
+    Naively extract existing translations from index.php by searching for
+    'code' => [ ... ] patterns. This is regex-based and assumes standard formatting.
+    """
+    if not os.path.exists(index_php_path):
+        return {}
+
+    with open(index_php_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Find the $I18N array block
+    match = re.search(r"\$I18N = \[(.*?)\];\n\n" , content, re.DOTALL)
+    if not match:
+        return {}
+
+    i18n_block = match.group(1)
+    
+    # Find individual language blocks: 'code' => [ ... ]
+    lang_blocks = re.findall(r"['\"]([a-z_]{2,5})['\"] => \[(.*?)\]", i18n_block, re.DOTALL)
+    
+    existing = {}
+    for code, block in lang_blocks:
+        # Extract keys and values: 'key' => 'val'
+        pairs = re.findall(r"['\"](.*?)['\"] => ['\"](.*?)['\"]", block)
+        existing[code] = {k: v.replace("\\'", "'").replace("\\\\", "\\") for k, v in pairs if not k.startswith("_")}
+    
+    return existing
 
 
 def php_string(s: str) -> str:
@@ -249,32 +287,54 @@ def progress_bar(current: int, total: int, start_time: float, width: int = 40) -
 
 
 def main():
+    index_php_path = os.path.join(os.path.dirname(__file__), "index.php")
     out_path = os.path.join(os.path.dirname(__file__), "i18n_output.php")
+    
+    print("Loading existing translations from index.php...")
+    existing_all = load_existing_translations(index_php_path)
+    
     all_langs: dict[str, dict] = {}
-
-    # English first — no API call needed
     all_langs["en"] = dict(EN_STRINGS)
 
-    codes_to_translate = [c for c in LANGUAGES if c != "en"]
-    total = len(codes_to_translate)
+    codes_to_process = [c for c in LANGUAGES if c != "en"]
+    total = len(codes_to_process)
     start_time = time.time()
 
-    for i, code in enumerate(codes_to_translate, 1):
+    for i, code in enumerate(codes_to_process, 1):
         lang_name = LANGUAGES[code][0]
-        # Print progress bar with ETA
+        existing = existing_all.get(code, {})
+        
+        # Determine what's missing
+        missing_keys = [k for k in EN_STRINGS if k not in existing]
+        
+        if not missing_keys:
+            # Nothing to do for this language
+            all_langs[code] = existing
+            status = progress_bar(i, total, start_time)
+            print(f"\r{status} | {code} ({lang_name}) - Up to date", end="", flush=True)
+            continue
+
         status = progress_bar(i - 1, total, start_time)
-        print(f"\r{status} | {code} ({lang_name})", end="", flush=True)
+        print(f"\r{status} | {code} ({lang_name}) - Translating {len(missing_keys)} keys", end="", flush=True)
         
         try:
-            translated = translate(code)
-            # Ensure every key is present (fall back to English if GPT dropped one)
+            strings_to_translate = {k: EN_STRINGS[k] for k in missing_keys}
+            new_translations = translate(code, strings_to_translate)
+            
+            # Merge new with existing
+            merged = dict(existing)
             for k in EN_STRINGS:
-                if k not in translated:
-                    translated[k] = EN_STRINGS[k]
-            all_langs[code] = translated
+                if k in new_translations:
+                    merged[k] = new_translations[k]
+                elif k not in merged:
+                    merged[k] = EN_STRINGS[k] # Fallback
+            
+            all_langs[code] = merged
         except Exception as e:
             print(f"\n✗ {code}: {type(e).__name__}: {e}")
-            all_langs[code] = dict(EN_STRINGS)  # fallback to English
+            all_langs[code] = dict(existing)
+            for k in EN_STRINGS:
+                if k not in all_langs[code]: all_langs[code][k] = EN_STRINGS[k]
 
     # Final progress bar
     status = progress_bar(total, total, start_time)
@@ -287,7 +347,7 @@ def main():
     
     elapsed = time.time() - start_time
     elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s" if elapsed > 60 else f"{int(elapsed)}s"
-    print(f"\nDone! {total} languages translated in {elapsed_str}.")
+    print(f"\nDone! {total} languages processed in {elapsed_str}.")
     print(f"Output written to {out_path}")
     
     # Validation: check for missing translations

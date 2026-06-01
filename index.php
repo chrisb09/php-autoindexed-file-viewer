@@ -4,7 +4,7 @@ set_time_limit(0);
 ignore_user_abort(true);
 
 // --- VERSION ---
-define('APP_VERSION', '0.5.1');
+define('APP_VERSION', '0.5.2');
 
 // --- I18N ---
 // Language definitions: each key is a locale code.
